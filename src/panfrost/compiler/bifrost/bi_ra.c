@@ -637,12 +637,11 @@ bi_rewrite_index_src_single(bi_instr *ins, bi_index old, bi_index new)
    }
 }
 
-/* If register allocation fails, find the best spill node */
+/* Nodes that bi_spill_register() must not spill */
 
-static signed
-bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
+static BITSET_WORD *
+bi_find_no_spill(bi_context *ctx, struct lcra_state *l)
 {
-   /* Pick a node satisfying bi_spill_register's preconditions */
    BITSET_WORD *no_spill = BITSET_CALLOC(l->node_count);
 
    bi_foreach_instr_global(ctx, ins) {
@@ -662,6 +661,18 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
       }
    }
 
+   return no_spill;
+}
+
+/* If register allocation fails at node, find the best spill node. With
+ * coloured_only, of the nodes interfering with it only those holding a
+ * register count: spilling another one does not let node be coloured.
+ */
+
+static signed
+bi_choose_spill_node(struct lcra_state *l, unsigned node,
+                     const BITSET_WORD *no_spill, bool coloured_only)
+{
    unsigned best_benefit = 0;
    signed best_node = -1;
 
@@ -669,13 +680,13 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
     * rather the ones interfering with it, if that would be
     * better
     */
-   if (!BITSET_TEST(no_spill, l->spill_node)) {
-      best_node = l->spill_node;
+   if (!BITSET_TEST(no_spill, node)) {
+      best_node = node;
       best_benefit = lcra_count_constraints(l, best_node);
    }
 
-   if (nodearray_is_sparse(&l->linear[l->spill_node])) {
-      nodearray_sparse_foreach(&l->linear[l->spill_node], elem) {
+   if (nodearray_is_sparse(&l->linear[node])) {
+      nodearray_sparse_foreach(&l->linear[node], elem) {
          unsigned i = nodearray_sparse_key(elem);
          unsigned constraint = nodearray_sparse_value(elem);
 
@@ -687,6 +698,9 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
          if (BITSET_TEST(no_spill, i))
             continue;
 
+         if (coloured_only && l->solutions[i] == ~0)
+            continue;
+
          unsigned benefit = lcra_count_constraints(l, i);
 
          if (benefit > best_benefit) {
@@ -695,7 +709,7 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
          }
       }
    } else {
-      nodearray_value *row = l->linear[l->spill_node].dense;
+      nodearray_value *row = l->linear[node].dense;
 
       for (unsigned i = 0; i < l->node_count; ++i) {
          /* Only spill nodes that interfere with the node failing
@@ -704,6 +718,9 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
             continue;
 
          if (BITSET_TEST(no_spill, i))
+            continue;
+
+         if (coloured_only && l->solutions[i] == ~0)
             continue;
 
          unsigned benefit = lcra_count_constraints(l, i);
@@ -715,8 +732,85 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
       }
    }
 
-   free(no_spill);
    return best_node;
+}
+
+/* Colour one node as lcra_solve() does */
+
+static bool
+lcra_solve_node(struct lcra_state *l, unsigned i)
+{
+   u_foreach_bit64(r, l->affinity[i]) {
+      l->solutions[i] = r;
+
+      if (lcra_test_linear(l, l->solutions, i))
+         return true;
+   }
+
+   l->solutions[i] = ~0;
+   return false;
+}
+
+struct bi_spill_choice {
+   /* Node to spill */
+   unsigned node;
+   /* Node that could not be coloured, bi_spill_register()'s spill_point */
+   unsigned point;
+};
+
+/* Every failed round rebuilds liveness, interference and the solve for the
+ * whole shader, so a round spills for more than one failure. Two take a
+ * quarter off the compile time of shaders that spill in LCRA, for 0.1% more
+ * cycles; four a third, but for 1% more.
+ */
+#define BI_SPILLS_PER_ROUND 2
+
+/*
+ * lcra_solve() failed at l->spill_node. Choose what this round spills: the
+ * solve goes on, and for each node it cannot colour, the one of that node
+ * and the coloured nodes interfering with it that bi_choose_spill_node()
+ * prefers leaves the problem, until max are chosen. Returns how many.
+ */
+static unsigned
+bi_choose_spills(bi_context *ctx, struct lcra_state *l,
+                 struct bi_spill_choice *spills, unsigned max)
+{
+   BITSET_WORD *no_spill = bi_find_no_spill(ctx, l);
+   unsigned count = 0;
+
+   /* lcra_solve() leaves the last register it tried */
+   l->solutions[l->spill_node] = ~0;
+
+   for (unsigned step = l->spill_node; step < l->node_count && count < max;
+        ++step) {
+      if (l->solutions[step] != ~0 || l->affinity[step] == 0)
+         continue;
+
+      while (!lcra_solve_node(l, step)) {
+         signed best = bi_choose_spill_node(l, step, no_spill, true);
+
+         /* Nothing coloured can go: as with one spill per round */
+         if (best < 0 && count == 0)
+            best = bi_choose_spill_node(l, step, no_spill, false);
+
+         if (best < 0)
+            goto done;
+
+         spills[count++] =
+            (struct bi_spill_choice){.node = best, .point = step};
+
+         /* Spilled: out of the problem */
+         l->solutions[best] = ~0;
+         l->affinity[best] = 0;
+
+         if (best == step || count == max)
+            break;
+      }
+   }
+
+done:
+   free(no_spill);
+   return count;
 }
 
 static unsigned
@@ -1478,17 +1572,20 @@ bi_register_allocate(bi_context *ctx)
       if (success) {
          ctx->info.work_reg_count = BI_MAX_REGS;
       } else {
-         signed spill_node = bi_choose_spill_node(ctx, l);
+         struct bi_spill_choice spills[BI_SPILLS_PER_ROUND];
+         unsigned n = bi_choose_spills(ctx, l, spills, ARRAY_SIZE(spills));
 
-         if (spill_node == -1)
+         if (n == 0)
             UNREACHABLE("Failed to choose spill node\n");
 
          if (ctx->inputs->is_blend)
             UNREACHABLE("Blend shaders may not spill");
 
-         spill_count =
-            bi_spill_register(ctx, bi_get_index(spill_node), spill_count,
-                              bi_get_index(l->spill_node));
+         for (unsigned i = 0; i < n; ++i) {
+            spill_count =
+               bi_spill_register(ctx, bi_get_index(spills[i].node),
+                                 spill_count, bi_get_index(spills[i].point));
+         }
 
          lcra_free(l);
          l = NULL;
