@@ -1482,8 +1482,23 @@ compute_spill_cost(bi_context *ctx)
    ralloc_free(mctx);
 }
 
-void
-bi_register_allocate(bi_context *ctx)
+/* LCRA failures a shader spilled in SSA form to the whole register file may
+ * take, spilling BI_SPILLS_PER_ROUND more values each, before it is compiled
+ * again with the slack. ARMSX2's spilling shaders (demand 79 to 119) colour
+ * after 1 to 3.
+ */
+#define BI_FULL_FILE_ROUNDS 4
+
+/*
+ * With full_file_spill, a shader whose demand is over the register file,
+ * but at most twice the file, is spilled in SSA form to the whole file, and
+ * false is returned, with the shader half allocated, when LCRA still cannot
+ * colour it after BI_FULL_FILE_ROUNDS rounds of spilling: the caller then
+ * compiles it again with full_file_spill false, which spills to 8 registers
+ * fewer.
+ */
+bool
+bi_register_allocate(bi_context *ctx, bool full_file_spill)
 {
    struct lcra_state *l = NULL;
    bool success = false;
@@ -1493,6 +1508,8 @@ bi_register_allocate(bi_context *ctx)
    /* Number of bytes of memory we've spilled into */
    unsigned spill_count = ctx->info.tls_size;
    bool spilled_ssa = false;
+   bool spilled_to_full_file = false;
+   unsigned full_file_rounds = 0;
 
    if (ctx->arch >= 9)
       va_lower_split_64bit(ctx);
@@ -1517,17 +1534,30 @@ bi_register_allocate(bi_context *ctx)
          if (ctx->inputs->is_blend)
             UNREACHABLE("Blend shaders may not spill");
 
-         /* Spill to fewer registers than the file has, leaving the
-          * slack bi_calc_register_demand() reserves for spilling (its
-          * reserved_size). LCRA is no SSA allocator: after
-          * bi_out_of_ssa it may not colour a program whose pressure
-          * is at the bound (vectors, the copies of phis), and every
-          * failure below costs a full rebuild of the problem for each
-          * node it spills. Large shaders took hundreds of those.
+         /* LCRA is no SSA allocator: after bi_out_of_ssa it may not
+          * colour a program whose pressure is at the bound (vectors,
+          * the copies of phis), and every failure below costs a full
+          * rebuild of the problem for each node it spills; large
+          * shaders took hundreds of those. Spilling to fewer registers
+          * than the file has, leaving the slack
+          * bi_calc_register_demand() reserves for spilling (its
+          * reserved_size), avoids that, but costs a shader that
+          * colours at the full file after a few more spills the values
+          * it spills needlessly (ARMSX2's CAS upscaling: 116 cycles
+          * against 99). The number of those rounds grows with the demand
+          * over the file: Luigi's Mansion 2's vertex shaders (demand 147
+          * to 176) took 9 to 80 at the full file. So the full file is
+          * tried for a demand of at most twice the file, and the shader
+          * is compiled again with the slack when LCRA does not colour it
+          * within BI_FULL_FILE_ROUNDS.
           */
          const unsigned target =
-            regs_to_use == BI_MAX_REGS ? BI_MAX_REGS - 8 : regs_to_use;
+            regs_to_use != BI_MAX_REGS ? regs_to_use
+            : full_file_spill && register_demand <= 2 * BI_MAX_REGS
+               ? BI_MAX_REGS
+               : BI_MAX_REGS - 8;
          bi_spill_ssa(ctx, target);
+         spilled_to_full_file = target == BI_MAX_REGS;
          spill_count += bi_lower_spill(ctx, spill_count);
          spilled_ssa = true;
 
@@ -1571,6 +1601,10 @@ bi_register_allocate(bi_context *ctx)
 
       if (success) {
          ctx->info.work_reg_count = BI_MAX_REGS;
+      } else if (spilled_to_full_file &&
+                 full_file_rounds++ == BI_FULL_FILE_ROUNDS) {
+         lcra_free(l);
+         return false;
       } else {
          struct bi_spill_choice spills[BI_SPILLS_PER_ROUND];
          unsigned n = bi_choose_spills(ctx, l, spills, ARRAY_SIZE(spills));
@@ -1607,4 +1641,5 @@ bi_register_allocate(bi_context *ctx)
    bi_install_registers(ctx, l);
 
    lcra_free(l);
+   return true;
 }

@@ -4229,11 +4229,13 @@ compare_u32(const void* a, const void* b, void* _)
    return va - vb;
 }
 
+/* The program in BIR, register allocated (bi_register_allocate: NULL when
+ * that gives up on a spill to the full register file). offset is where the
+ * program will go in the binary. */
 static bi_context *
-bi_compile_variant_nir(nir_shader *nir,
-                       const struct pan_compile_inputs *inputs,
-                       struct util_dynarray *binary, struct pan_shader_info *pinfo,
-                       struct pan_stats *stats, enum bi_idvs_mode idvs)
+bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
+                      struct pan_shader_info *pinfo, enum bi_idvs_mode idvs,
+                      unsigned offset, bool full_file_spill)
 {
    bi_context *ctx = rzalloc(NULL, bi_context);
    struct bi_shader_info info = {
@@ -4241,9 +4243,6 @@ bi_compile_variant_nir(nir_shader *nir,
       .bifrost = &pinfo->bifrost,
       .tls_size = pinfo->tls_size,
    };
-
-   /* There may be another program in the dynarray, start at the end */
-   unsigned offset = binary->size;
 
    ctx->inputs = inputs;
    ctx->nir = nir;
@@ -4464,7 +4463,39 @@ bi_compile_variant_nir(nir_shader *nir,
       bi_validate(ctx, "Pre-RA scheduling");
    }
 
-   bi_register_allocate(ctx);
+   if (!bi_register_allocate(ctx, full_file_spill)) {
+      ralloc_free(ctx);
+      return NULL;
+   }
+
+   return ctx;
+}
+
+static bi_context *
+bi_compile_variant_nir(nir_shader *nir,
+                       const struct pan_compile_inputs *inputs,
+                       struct util_dynarray *binary, struct pan_shader_info *pinfo,
+                       struct pan_stats *stats, enum bi_idvs_mode idvs)
+{
+   /* There may be another program in the dynarray, start at the end */
+   unsigned offset = binary->size;
+
+   /* A second attempt starts from the FAU layout and Bifrost info the
+    * first found: those are the parts of pinfo compiling writes before
+    * register allocation (the push of UBO words, message preloads).
+    */
+   const struct pan_fau_layout fau = pinfo->fau;
+   const struct bifrost_shader_info bifrost = pinfo->bifrost;
+   bi_context *ctx = bi_compile_variant_ra(nir, inputs, pinfo, idvs, offset, true);
+   if (!ctx) {
+      pinfo->fau = fau;
+      pinfo->bifrost = bifrost;
+      ctx = bi_compile_variant_ra(nir, inputs, pinfo, idvs, offset, false);
+   }
+
+   bool optimize = !(bifrost_debug & BIFROST_DBG_NOOPT);
+   bool skip_internal = ctx->nir->info.internal;
+   skip_internal &= !(bifrost_debug & BIFROST_DBG_INTERNAL);
 
    if (likely(optimize))
       bi_opt_post_ra(ctx);
