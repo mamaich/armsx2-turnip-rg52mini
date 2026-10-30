@@ -325,6 +325,16 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
                      bool split_file, unsigned arch)
 {
    bool aligned_sr = arch >= 9;
+
+   /* The nodes with live[i] != 0, so that only those are visited below:
+    * in a large shader few of the nodes are live at a time.
+    */
+   BITSET_WORD *live_set = BITSET_CALLOC(node_count);
+   for (unsigned i = 0; i < node_count; ++i) {
+      if (live[i])
+         BITSET_SET(live_set, i);
+   }
+
    bi_foreach_instr_in_block_rev(block, ins) {
       /* Mark all registers live after the instruction as
        * interfering with the destination */
@@ -348,7 +358,8 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
 
          l->affinity[node] &= affinity;
 
-         for (unsigned i = 0; i < node_count; ++i) {
+         unsigned i;
+         BITSET_FOREACH_SET(i, live_set, node_count) {
             uint8_t r = live[i];
 
             /* Nodes only interfere if they occupy
@@ -410,17 +421,26 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
             BITFIELD64_MASK(16) |
             BITFIELD64_BIT(bi_preload_reg(BI_PRELOAD_BLEND_LINK, arch));
 
-         for (unsigned i = 0; i < node_count; ++i) {
-            if (live[i])
-               l->affinity[i] &= ~clobber;
-         }
+         unsigned i;
+         BITSET_FOREACH_SET(i, live_set, node_count)
+            l->affinity[i] &= ~clobber;
       }
 
       /* Update live_in */
       preload_live = bi_postra_liveness_ins(preload_live, ins);
       bi_liveness_ins_update_ra(live, ins);
+
+      bi_foreach_dest(ins, d) {
+         if (!live[ins->dest[d].value])
+            BITSET_CLEAR(live_set, ins->dest[d].value);
+      }
+      bi_foreach_ssa_src(ins, s) {
+         if (live[ins->src[s].value])
+            BITSET_SET(live_set, ins->src[s].value);
+      }
    }
 
+   free(live_set);
    block->reg_live_in = preload_live;
 }
 
@@ -1020,6 +1040,93 @@ bi_mov_words_to(bi_builder *b, bi_index dst, bi_index src, unsigned words)
 }
 
 /*
+ * The SSA values read outside the block that defines them. A phi source
+ * counts as such a read (it becomes a move in the predecessor).
+ */
+static BITSET_WORD *
+bi_find_nonlocal_values(bi_context *ctx)
+{
+   bi_block **def_block = calloc(ctx->ssa_alloc, sizeof(bi_block *));
+   BITSET_WORD *nonlocal = BITSET_CALLOC(ctx->ssa_alloc);
+
+   bi_foreach_block(ctx, block) {
+      bi_foreach_instr_in_block(block, I) {
+         bi_foreach_ssa_dest(I, d) {
+            if (!I->dest[d].memory)
+               def_block[I->dest[d].value] = block;
+         }
+      }
+   }
+
+   bi_foreach_block(ctx, block) {
+      bi_foreach_instr_in_block(block, I) {
+         bi_foreach_ssa_src(I, s) {
+            if (I->src[s].memory)
+               continue;
+            if (I->op == BI_OPCODE_PHI || def_block[I->src[s].value] != block)
+               BITSET_SET(nonlocal, I->src[s].value);
+         }
+      }
+   }
+
+   free(def_block);
+   return nonlocal;
+}
+
+/* Copy a phi source into registers at b's cursor. */
+static void
+bi_phi_copy_to(bi_builder *b, bi_index dst, bi_index src, unsigned words)
+{
+   assert(!src.abs);
+   assert(!src.neg);
+   assert(src.swizzle == BI_SWIZZLE_H01);
+
+   if (src.memory) {
+      /* spilled register, need to un-spill */
+      bi_load_tl(b, words * 32, dst, src.value);
+   } else if (b->shader->arch >= 9 && src.type == BI_INDEX_CONSTANT) {
+      /* MOV of immediate needs lowering on Valhall */
+      bi_index zero = bi_fau(BIR_FAU_IMMEDIATE | 0, false);
+      for (unsigned w = 0; w < words; ++w) {
+         bi_index word_dst = dst;
+         word_dst.offset += w;
+         bi_iadd_imm_i32_to(b, word_dst, zero, w == 0 ? src.value : 0);
+      }
+   } else {
+      bi_mov_words_to(b, dst, src, words);
+   }
+}
+
+/*
+ * Whether the phis of block spilled to memory may be stored straight into
+ * their slots at the end of the predecessors. That turns the parallel copy
+ * on each edge into a sequential one, so no predecessor may lead elsewhere
+ * too, and no phi of the block may read a slot such a phi writes.
+ */
+static bool
+bi_can_store_mem_phis_in_preds(bi_block *block)
+{
+   bi_foreach_predecessor(block, pred) {
+      if ((*pred)->successors[1])
+         return false;
+   }
+
+   bi_foreach_phi_in_block(block, I) {
+      if (!I->dest[0].memory)
+         continue;
+
+      bi_foreach_phi_in_block(block, J) {
+         bi_foreach_ssa_src(J, s) {
+            if (J->src[s].memory && J->src[s].value == I->dest[0].value)
+               return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+/*
  * Brainless out-of-SSA pass. The eventual goal is to go out-of-SSA after RA and
  * coalesce implicitly with biased colouring in a tree scan allocator. For now,
  * this should be good enough for LCRA.
@@ -1030,15 +1137,43 @@ bi_out_of_ssa(bi_context *ctx)
    bi_index zero = bi_fau(BIR_FAU_IMMEDIATE | 0, false);
    unsigned first_reg = ctx->ssa_alloc;
    bool allow_propagate;
+   BITSET_WORD *nonlocal = bi_find_nonlocal_values(ctx);
 
    /* Trivially lower phis */
    bi_foreach_block(ctx, block) {
+      const bool mem_phis_in_preds = bi_can_store_mem_phis_in_preds(block);
+
       bi_foreach_instr_in_block_safe(block, I) {
          if (I->op != BI_OPCODE_PHI)
             break;
 
          unsigned words = I->table ? I->table : 1;
          assert(words >= 1 && words <= 4);
+
+         /* A phi spilled to memory has no register to arrive in:
+          * bi_spill_ssa counted none for it. Store each source into
+          * its slot at the end of the predecessor, rather than carry
+          * the value into this block in a register, which would raise
+          * the pressure on the edge past what spilling bounded by one
+          * register per such phi.
+          */
+         if (I->dest[0].memory && mem_phis_in_preds) {
+            bi_foreach_predecessor(block, pred) {
+               bi_builder b = bi_init_builder(ctx, bi_after_block_logical(*pred));
+               bi_index src = I->src[bi_predecessor_index(block, *pred)];
+
+               if (src.type != BI_INDEX_NORMAL || src.memory) {
+                  bi_index tmp = bi_temp(ctx);
+                  bi_phi_copy_to(&b, tmp, src, words);
+                  src = tmp;
+               }
+
+               bi_store_tl(&b, words * 32, src, I->dest[0].value);
+            }
+
+            bi_remove_instruction(I);
+            continue;
+         }
 
          /* Assign a register for the phi */
          bi_index reg = bi_temp(ctx);
@@ -1052,27 +1187,17 @@ bi_out_of_ssa(bi_context *ctx)
             bi_builder b = bi_init_builder(ctx, bi_after_block_logical(*pred));
             unsigned i = bi_predecessor_index(block, *pred);
 
-            assert(!I->src[i].abs);
-            assert(!I->src[i].neg);
-            assert(I->src[i].swizzle == BI_SWIZZLE_H01);
-
-            if (I->src[i].memory)
-               /* spilled register, need to un-spill */
-               bi_load_tl(&b, words * 32, reg, I->src[i].value);
-            else if (ctx->arch >= 9 && I->src[i].type == BI_INDEX_CONSTANT) {
-               /* MOV of immediate needs lowering on Valhall */
-               for (unsigned w = 0; w < words; ++w) {
-                  bi_index word_reg = reg;
-                  word_reg.offset += w;
-                  bi_iadd_imm_i32_to(&b, word_reg, zero,
-                                     w == 0 ? I->src[i].value : 0);
-               }
-            } else
-               bi_mov_words_to(&b, reg, I->src[i], words);
+            bi_phi_copy_to(&b, reg, I->src[i], words);
          }
 
-         /* Replace the phi with a move */
-         allow_propagate = true;
+         /* Replace the phi with a move. Propagating the move is only
+          * worth it if that removes it: if the phi is read in other
+          * blocks as well, the move stays, and the propagation would
+          * keep reg and the phi alive side by side for the rest of the
+          * block, raising the register pressure that spilling bounded.
+          */
+         allow_propagate =
+            !I->dest[0].memory && !BITSET_TEST(nonlocal, I->dest[0].value);
          bi_builder b = bi_init_builder(ctx, bi_before_instr(I));
          if (I->dest[0].memory) {
             /* dest was spilled to memory */
@@ -1176,6 +1301,7 @@ bi_out_of_ssa(bi_context *ctx)
 
    free(used);
    free(multiple_uses);
+   free(nonlocal);
    return first_reg;
 }
 
@@ -1272,6 +1398,7 @@ bi_register_allocate(bi_context *ctx)
    unsigned max_iters = 2000;
    /* Number of bytes of memory we've spilled into */
    unsigned spill_count = ctx->info.tls_size;
+   bool spilled_ssa = false;
 
    if (ctx->arch >= 9)
       va_lower_split_64bit(ctx);
@@ -1296,8 +1423,19 @@ bi_register_allocate(bi_context *ctx)
          if (ctx->inputs->is_blend)
             UNREACHABLE("Blend shaders may not spill");
 
-         bi_spill_ssa(ctx, regs_to_use);
+         /* Spill to fewer registers than the file has, leaving the
+          * slack bi_calc_register_demand() reserves for spilling (its
+          * reserved_size). LCRA is no SSA allocator: after
+          * bi_out_of_ssa it may not colour a program whose pressure
+          * is at the bound (vectors, the copies of phis), and every
+          * failure below costs a full rebuild of the problem for each
+          * node it spills. Large shaders took hundreds of those.
+          */
+         const unsigned target =
+            regs_to_use == BI_MAX_REGS ? BI_MAX_REGS - 8 : regs_to_use;
+         bi_spill_ssa(ctx, target);
          spill_count += bi_lower_spill(ctx, spill_count);
+         spilled_ssa = true;
 
          /* By default, we use packed TLS addressing on Valhall.
           * We cannot cross 16 byte boundaries with packed TLS
@@ -1319,8 +1457,10 @@ bi_register_allocate(bi_context *ctx)
    bi_coalesce_tied(ctx);
    squeeze_index(ctx);
 
-   /* Try with reduced register pressure to improve thread count */
-   if (ctx->arch >= 7) {
+   /* Try with reduced register pressure to improve thread count, unless
+    * the shader needed spilling to fit the whole register file.
+    */
+   if (ctx->arch >= 7 && !spilled_ssa) {
       l = bi_allocate_registers(ctx, &success, false);
 
       if (success) {
