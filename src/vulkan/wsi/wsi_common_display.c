@@ -1962,6 +1962,23 @@ wsi_display_swapchain_destroy(struct wsi_swapchain *drv_chain,
 
    _wsi_display_cleanup_state(chain);
 
+   /* A flip still pending carries one of these images as its user data,
+    * and the wait thread's page flip handler would read the image and the
+    * swapchain after they are freed. Wait for it, and for the flips of
+    * queued images the handler starts meanwhile; at most a second, in case
+    * the event never comes (the display went away).
+    */
+   mtx_lock(&wsi->wait_mutex);
+   const uint64_t timeout = wsi_rel_to_abs_time(1000000000ull);
+   for (;;) {
+      bool flipping = false;
+      for (uint32_t i = 0; i < chain->base.image_count; i++)
+         flipping |= chain->images[i].state == WSI_IMAGE_FLIPPING;
+      if (!flipping || wsi_display_wait_for_event(wsi, timeout) != thrd_success)
+         break;
+   }
+   mtx_unlock(&wsi->wait_mutex);
+
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       wsi_display_image_finish(drv_chain, &chain->images[i]);
 
