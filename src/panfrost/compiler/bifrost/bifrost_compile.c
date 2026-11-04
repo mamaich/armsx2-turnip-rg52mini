@@ -4229,6 +4229,89 @@ compare_u32(const void* a, const void* b, void* _)
    return va - vb;
 }
 
+/* Whether a control flow node is inside a loop. */
+static bool
+bi_cf_node_in_loop(nir_cf_node *node)
+{
+   for (nir_cf_node *n = node->parent; n; n = n->parent) {
+      if (n->type == nir_cf_node_loop)
+         return true;
+   }
+   return false;
+}
+
+/*
+ * Vertex shaders: attribute loads outside loops whose uses are inside
+ * loops. Emulators that run a guest's shader program as a loop around a
+ * dispatch on the program counter (Azahar's PICA vertex shaders) read the
+ * attributes once before the loop and use them anywhere in it, so every
+ * attribute lives through the whole loop: in the large vertex shaders of
+ * Luigi's Mansion 2, 40 of the 64 registers at the point of highest demand.
+ * nir_opt_sink never moves code into a loop and nir_opt_gcm hoists it out.
+ *
+ * Instead a block of the outermost loop that uses an attribute loads it
+ * again after its phis, so the value lives only from there to its uses;
+ * an attribute load is one message for four components, where the spilled
+ * value is one fill per component. A use inside a loop nested in that one
+ * is served by a load at the end of the block before the nested loop, so
+ * no load runs once per iteration of a nested loop. Uses outside loops keep
+ * the original load.
+ *
+ * Run after the IDVS specialization's clean-up: its CSE would replace the
+ * loads in the loop by an original that dominates them.
+ */
+static bool
+bi_remat_attributes_in_loops(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_block_index);
+      nir_def **loads = calloc(impl->num_blocks, sizeof(nir_def *));
+      if (!loads)
+         return progress;
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         if (bi_cf_node_in_loop(&block->cf_node))
+            continue;
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_attr_pan)
+               continue;
+            memset(loads, 0, impl->num_blocks * sizeof(nir_def *));
+            nir_foreach_use_including_if_safe(use, &intr->def) {
+               if (nir_src_is_if(use))
+                  continue;
+               nir_instr *user = nir_src_use_instr(use);
+               if (user->type == nir_instr_type_phi || !bi_cf_node_in_loop(&user->block->cf_node))
+                  continue;
+               /* The outermost of the loops nested in another loop that
+                * hold the use, if any. */
+               nir_cf_node *nested = NULL;
+               for (nir_cf_node *n = user->block->cf_node.parent; n; n = n->parent) {
+                  if (n->type == nir_cf_node_loop && bi_cf_node_in_loop(n))
+                     nested = n;
+               }
+               nir_block *at = nested ? nir_cf_node_as_block(nir_cf_node_prev(nested)) : user->block;
+               if (!loads[at->index]) {
+                  nir_instr *load = nir_instr_clone(nir, instr);
+                  nir_instr_insert(nested ? nir_after_block_before_jump(at) : nir_after_phis(at), load);
+                  loads[at->index] = &nir_instr_as_intrinsic(load)->def;
+               }
+               nir_src_rewrite(use, loads[at->index]);
+               impl_progress = true;
+            }
+            if (nir_def_is_unused(&intr->def))
+               nir_instr_remove(instr);
+         }
+      }
+      free(loads);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 /* The program in BIR, register allocated (bi_register_allocate: NULL when
  * that gives up on a spill to the full register file). offset is where the
  * program will go in the binary. */
@@ -4284,6 +4367,10 @@ bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
          NIR_PASS(progress, nir, nir_opt_cse);
       }
    }
+
+   if (ctx->stage == MESA_SHADER_VERTEX && ctx->arch <= 7 &&
+       !(bifrost_debug & BIFROST_DBG_NOATTRREMAT))
+      NIR_PASS(_, nir, bi_remat_attributes_in_loops);
 
    /* If nothing is pushed, all UBOs need to be uploaded */
    ctx->ubo_mask = ~0;
