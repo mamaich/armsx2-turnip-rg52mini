@@ -230,6 +230,76 @@ mem_vectorize_cb(unsigned align_mul, unsigned align_offset, unsigned bit_size,
    return bytes <= combined_align;
 }
 
+/*
+ * nir_opt_if is not run on Bifrost (see bi_optimize_loop), and with it goes
+ * the evaluation of an if's condition in its branches, where the value is
+ * known (opt_if_evaluate_condition_use). Azahar's PICA vertex shaders test
+ * a boolean uniform again in the else of an if on the same uniform, nested
+ * many levels deep. Once CSE has merged the uniform's reads, every inner if
+ * has a known condition, yet each level stays a merge of the values of both
+ * of its branches: the dead ones keep the old values of the PICA registers
+ * alive next to the new ones.
+ *
+ * Here the uses of an if's condition inside its branches (conditions of
+ * inner ifs and ALU sources, not phi sources) take the known value;
+ * nir_opt_dead_cf then removes the dead branches.
+ */
+static bool
+bi_fold_known_conditions(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_block_index);
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      nir_def *known[2] = {NULL, NULL};
+      bool impl_progress = false;
+
+      nir_foreach_block(block, impl) {
+         nir_if *nif = nir_block_get_following_if(block);
+         /* A constant condition (also one set here) is dead_cf's. */
+         if (!nif || nir_src_is_const(nif->condition))
+            continue;
+         nir_def *cond = nif->condition.ssa;
+
+         /* The blocks of a branch are numbered in a row. */
+         const unsigned then_first = nir_if_first_then_block(nif)->index;
+         const unsigned then_last = nir_if_last_then_block(nif)->index;
+         const unsigned else_first = nir_if_first_else_block(nif)->index;
+         const unsigned else_last = nir_if_last_else_block(nif)->index;
+
+         nir_foreach_use_including_if_safe(use, cond) {
+            nir_block *at;
+            if (nir_src_is_if(use)) {
+               nir_if *user = nir_src_use_if(use);
+               if (user == nif)
+                  continue;
+               at = nir_cf_node_as_block(nir_cf_node_prev(&user->cf_node));
+            } else {
+               nir_instr *user = nir_src_use_instr(use);
+               if (user->type == nir_instr_type_phi)
+                  continue;
+               at = user->block;
+            }
+
+            bool value;
+            if (at->index >= then_first && at->index <= then_last)
+               value = true;
+            else if (at->index >= else_first && at->index <= else_last)
+               value = false;
+            else
+               continue;
+
+            if (!known[value])
+               known[value] = nir_imm_bool(&b, value);
+            nir_src_rewrite(use, known[value]);
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static void
 bi_optimize_loop(nir_shader *nir, unsigned arch, bool allow_copies)
 {
@@ -295,6 +365,8 @@ bi_optimize_loop(nir_shader *nir, unsigned arch, bool allow_copies)
          NIR_PASS(
             progress, nir, nir_opt_if,
             nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
+      else if (!(bifrost_debug & BIFROST_DBG_NOFOLDIF))
+         NIR_PASS(progress, nir, bi_fold_known_conditions);
 
       NIR_PASS(progress, nir, nir_opt_phi_to_bool);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);

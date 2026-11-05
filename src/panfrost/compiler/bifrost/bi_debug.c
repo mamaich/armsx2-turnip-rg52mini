@@ -31,6 +31,7 @@ static const struct debug_named_value bifrost_debug_options[] = {
    {"debuginfo",  BIFROST_DBG_DEBUGINFO,  "Print debug information"},
    {"noattrremat", BIFROST_DBG_NOATTRREMAT, "Keep vertex attribute loads out of loops"},
    {"notreeremat", BIFROST_DBG_NOTREEREMAT, "Keep cheap expressions where they are computed"},
+   {"nofoldif",   BIFROST_DBG_NOFOLDIF,   "Keep the uses of an if's condition in its branches"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
