@@ -4359,9 +4359,14 @@ bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
    if (idvs == BI_IDVS_POSITION || idvs == BI_IDVS_VARYING) {
       /* Specializing shaders for IDVS is destructive, so we need to
        * clone. However, the last (second) IDVS shader does not need
-       * to be preserved so we can skip cloning that one.
+       * to be preserved so we can skip cloning that one, unless this
+       * is the attempt at the full register file: when that gives up,
+       * bi_compile_variant_nir compiles the variant again from the same
+       * NIR, which must not be the one specialized and cleaned up here
+       * already (that clean-up's CSE would merge back the attribute
+       * loads bi_remat_attributes_in_loops put into the loops).
        */
-      if (offset == 0)
+      if (offset == 0 || full_file_spill)
          ctx->nir = nir = nir_shader_clone(ctx, nir);
 
       uint64_t position = VA_SHADER_OUTPUT_POSITION_BIT |
