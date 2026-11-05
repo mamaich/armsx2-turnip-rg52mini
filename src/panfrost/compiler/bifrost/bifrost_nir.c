@@ -300,6 +300,196 @@ bi_fold_known_conditions(nir_shader *nir)
    return progress;
 }
 
+/*
+ * Loop-carried flags that compare one value with constants. Azahar's PICA
+ * vertex shaders run the guest program in a loop that dispatches on its
+ * program counter: at the end of each pass they compute, for every label
+ * the program may jump to, whether the counter is at it, and the next pass
+ * tests those flags, each a phi of the loop header that is false on entry.
+ * That is a register per label through the whole loop, where the counter
+ * alone would do. Such a phi, (false from before the loop, ieq(x, K) from
+ * its end), becomes ieq(p, K) after the header's phis, with p a header phi
+ * of x whose value on entry is no K of the group: the loop's own phi of x
+ * if its value on entry is a constant other than K, else one made here for
+ * the flags of x left (two at least), with a value on entry none of them
+ * compares equal to. nir_opt_sink later moves the comparisons to their uses.
+ */
+struct bi_flag_phi {
+   nir_phi_instr *phi;
+   nir_def *x;
+   uint32_t k;
+};
+
+static bool
+bi_flag_phi_match(nir_phi_instr *phi, nir_block *preheader, struct bi_flag_phi *f)
+{
+   if (phi->def.num_components != 1 || phi->def.bit_size != 1 ||
+       exec_list_length(&phi->srcs) != 2)
+      return false;
+   nir_def *entry = NULL, *latch = NULL;
+   nir_foreach_phi_src(src, phi) {
+      if (src->pred == preheader)
+         entry = src->src.ssa;
+      else
+         latch = src->src.ssa;
+   }
+   if (!entry || !latch || nir_def_instr(entry)->type != nir_instr_type_load_const ||
+       nir_instr_as_load_const(nir_def_instr(entry))->value[0].b)
+      return false;
+   nir_instr *li = nir_def_instr(latch);
+   if (li->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(li);
+   if (alu->op != nir_op_ieq)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_alu_src *c = &alu->src[i], *v = &alu->src[1 - i];
+      if (nir_src_is_const(c->src) && !nir_src_is_const(v->src) &&
+          v->src.ssa->num_components == 1 && v->src.ssa->bit_size == 32) {
+         f->phi = phi;
+         f->x = v->src.ssa;
+         f->k = nir_src_comp_as_uint(c->src, c->swizzle[0]);
+         return true;
+      }
+   }
+   return false;
+}
+
+static int
+bi_flag_phi_cmp(const void *a, const void *b)
+{
+   const struct bi_flag_phi *p = a, *q = b;
+   if (p->x->index != q->x->index)
+      return p->x->index < q->x->index ? -1 : 1;
+   return p->k < q->k ? -1 : p->k > q->k;
+}
+
+static bool
+bi_opt_loop_header_flags(nir_shader *nir, nir_function_impl *impl, nir_loop *loop)
+{
+   nir_block *header = nir_loop_first_block(loop);
+   nir_cf_node *prev = nir_cf_node_prev(&loop->cf_node);
+   if (!prev || prev->type != nir_cf_node_block || nir_loop_has_continue_construct(loop))
+      return false;
+   nir_block *preheader = nir_cf_node_as_block(prev);
+
+   unsigned n = 0, cap = 0;
+   nir_foreach_phi(phi, header)
+      cap++;
+   if (cap == 0)
+      return false;
+   struct bi_flag_phi *flags = malloc(cap * sizeof(*flags));
+   if (!flags)
+      return false;
+   nir_foreach_phi(phi, header) {
+      if (bi_flag_phi_match(phi, preheader, &flags[n]))
+         n++;
+   }
+   qsort(flags, n, sizeof(*flags), bi_flag_phi_cmp);
+
+   bool progress = false;
+   nir_builder b = nir_builder_at(nir_after_phis(header));
+   for (unsigned i = 0, run; i < n; i += run) {
+      nir_def *x = flags[i].x;
+      for (run = 1; i + run < n && flags[i + run].x == x; run++)
+         ;
+      /* The loop's own phi of x, with a constant value on entry. */
+      nir_phi_instr *own = NULL;
+      uint32_t own_entry = 0;
+      nir_foreach_phi(phi, header) {
+         nir_phi_src *e = nir_phi_get_src_from_block(phi, preheader);
+         if (exec_list_length(&phi->srcs) != 2 || !e || !nir_src_is_const(e->src) ||
+             phi->def.num_components != 1 || phi->def.bit_size != 32)
+            continue;
+         nir_foreach_phi_src(src, phi) {
+            if (src->pred != preheader && src->src.ssa == x) {
+               own = phi;
+               own_entry = nir_src_as_uint(e->src);
+            }
+         }
+         if (own)
+            break;
+      }
+      unsigned left = 0;
+      for (unsigned j = i; j < i + run; j++) {
+         if (own && flags[j].k != own_entry) {
+            nir_def_replace(&flags[j].phi->def, nir_ieq_imm(&b, &own->def, flags[j].k));
+            flags[j].phi = NULL;
+            progress = true;
+         } else {
+            left++;
+         }
+      }
+      if (left < 2)
+         continue;
+      /* A value on entry that is no K of the group. */
+      uint32_t entry = UINT32_MAX;
+      for (bool clash = true; clash; ) {
+         clash = false;
+         for (unsigned j = i; j < i + run; j++)
+            clash |= flags[j].k == entry;
+         if (clash)
+            entry--;
+      }
+      nir_phi_instr *tmpl = NULL;
+      for (unsigned j = i; j < i + run && !tmpl; j++)
+         tmpl = flags[j].phi;
+      nir_phi_instr *p = nir_phi_instr_create(nir);
+      nir_def_init(&p->instr, &p->def, 1, 32);
+      nir_builder eb = nir_builder_at(nir_before_impl(impl));
+      nir_phi_instr_add_src(p, preheader, nir_imm_int(&eb, entry));
+      nir_foreach_phi_src(src, tmpl) {
+         if (src->pred != preheader)
+            nir_phi_instr_add_src(p, src->pred, x);
+      }
+      nir_instr_insert(nir_before_block(header), &p->instr);
+      for (unsigned j = i; j < i + run; j++) {
+         if (!flags[j].phi)
+            continue;
+         nir_def_replace(&flags[j].phi->def, nir_ieq_imm(&b, &p->def, flags[j].k));
+         progress = true;
+      }
+   }
+   free(flags);
+   return progress;
+}
+
+static bool
+bi_opt_loop_flags_cf(nir_shader *nir, nir_function_impl *impl, struct exec_list *list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= bi_opt_loop_flags_cf(nir, impl, &nif->then_list);
+         progress |= bi_opt_loop_flags_cf(nir, impl, &nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         progress |= bi_opt_loop_header_flags(nir, impl, loop);
+         progress |= bi_opt_loop_flags_cf(nir, impl, &loop->body);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return progress;
+}
+
+static bool
+bi_opt_loop_flag_phis(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = bi_opt_loop_flags_cf(nir, impl, &impl->body);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static void
 bi_optimize_loop(nir_shader *nir, unsigned arch, bool allow_copies)
 {
@@ -367,6 +557,8 @@ bi_optimize_loop(nir_shader *nir, unsigned arch, bool allow_copies)
             nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
       else if (!(bifrost_debug & BIFROST_DBG_NOFOLDIF))
          NIR_PASS(progress, nir, bi_fold_known_conditions);
+      if (arch < 9 && !(bifrost_debug & BIFROST_DBG_NOLOOPFLAGS))
+         NIR_PASS(progress, nir, bi_opt_loop_flag_phis);
 
       NIR_PASS(progress, nir, nir_opt_phi_to_bool);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
