@@ -4327,6 +4327,290 @@ bi_remat_attributes_in_loops(nir_shader *nir)
    return progress;
 }
 
+/*
+ * Vertex shaders: cheap ALU expressions built again in the later blocks
+ * that use them. Azahar's PICA vertex shaders compute in one block many
+ * values that later blocks read, several of them from the same value:
+ * u * floor(v) and |v - floor(v)| * s + c, with u, s and c uniforms (FAU on
+ * Bifrost, no register). All those results live across the blocks in
+ * between, where v alone would do: in the heaviest vertex shader of Luigi's
+ * Mansion 2's Dark Moon, 48 such products of 24 values at the point of
+ * highest demand. nir_opt_sink moves an ALU instruction only when at most
+ * one source is not constant, and v - floor(v) has two.
+ *
+ * An ALU value with uses in later blocks whose expression in its own block
+ * reads only constants, push constants and one other value (its leaf),
+ * within BI_TREE_REMAT_MAX cheap instructions, is built again after the
+ * phis of each such block, unless that block may run more often (it is in
+ * a loop the value's block is not in). Only where it pays: two or more such
+ * values of a block have the same leaf, or the leaf lives on after that
+ * block anyway; else the leaf would just take the value's place.
+ */
+#define BI_TREE_REMAT_MAX 8
+
+struct bi_tree_info {
+   nir_def *leaf;   /* the one value the expression reads, NULL if none */
+   unsigned size;   /* instructions to build it again, 0: a leaf itself */
+   bool free;       /* a constant or a push constant: no register */
+};
+
+struct bi_tree_root {
+   nir_alu_instr *alu;
+   unsigned block, leaf; /* indices (leaf: UINT_MAX if none) */
+};
+
+static bool
+bi_tree_free_value(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_load_const ||
+       instr->type == nir_instr_type_undef)
+      return true;
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   return intr->intrinsic == nir_intrinsic_load_push_constant &&
+          nir_src_is_const(intr->src[0]);
+}
+
+static bool
+bi_tree_cheap_op(const nir_alu_instr *alu)
+{
+   if (alu->def.num_components != 1 ||
+       (alu->def.bit_size != 32 && alu->def.bit_size != 1))
+      return false;
+   switch (alu->op) {
+   case nir_op_frcp:
+   case nir_op_frsq:
+   case nir_op_fsqrt:
+   case nir_op_fexp2:
+   case nir_op_flog2:
+   case nir_op_fsin:
+   case nir_op_fcos:
+   case nir_op_fpow:
+   case nir_op_fdiv:
+   case nir_op_fmod:
+   case nir_op_frem:
+   case nir_op_idiv:
+   case nir_op_udiv:
+   case nir_op_imod:
+   case nir_op_umod:
+   case nir_op_irem:
+      return false;
+   default:
+      return true;
+   }
+}
+
+/* What def's expression in def's block reads, memoized by def index (defs
+ * from n on are the pass's own and count as leaves). */
+static struct bi_tree_info
+bi_tree_info(nir_def *def, struct bi_tree_info *infos, BITSET_WORD *done,
+             unsigned n)
+{
+   if (def->index >= n)
+      return (struct bi_tree_info){.leaf = def};
+   if (BITSET_TEST(done, def->index))
+      return infos[def->index];
+   struct bi_tree_info info = {.leaf = def};
+   nir_instr *instr = nir_def_instr(def);
+   if (bi_tree_free_value(def)) {
+      info.leaf = NULL;
+      info.free = true;
+   } else if (instr->type == nir_instr_type_alu &&
+              bi_tree_cheap_op(nir_instr_as_alu(instr))) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      nir_def *leaf = NULL;
+      unsigned size = 1;
+      bool one = true;
+      for (unsigned s = 0; s < nir_op_infos[alu->op].num_inputs && one; s++) {
+         nir_def *src = alu->src[s].src.ssa;
+         struct bi_tree_info si;
+         if (nir_def_instr(src)->block == instr->block)
+            si = bi_tree_info(src, infos, done, n);
+         else
+            si = (struct bi_tree_info){.leaf = src, .free = bi_tree_free_value(src)};
+         if (si.free)
+            continue;
+         size += si.size;
+         if (!si.leaf)
+            continue;
+         if (leaf && si.leaf != leaf)
+            one = false;
+         leaf = si.leaf;
+      }
+      if (one && size <= BI_TREE_REMAT_MAX) {
+         info.leaf = leaf;
+         info.size = size;
+      }
+   }
+   infos[def->index] = info;
+   BITSET_SET(done, def->index);
+   return info;
+}
+
+/* Whether a block may run more often than another that dominates it: it is
+ * in a loop that one is not in. */
+static bool
+bi_tree_block_runs_more(nir_block *use, nir_block *def)
+{
+   nir_cf_node *loop = NULL;
+   for (nir_cf_node *c = use->cf_node.parent; c; c = c->parent) {
+      if (c->type == nir_cf_node_loop) {
+         loop = c;
+         break;
+      }
+   }
+   if (!loop)
+      return false;
+   for (nir_cf_node *c = def->cf_node.parent; c; c = c->parent) {
+      if (c == loop)
+         return false;
+   }
+   return true;
+}
+
+/* Whether a use is one this pass moves: in another block that does not run
+ * more often, not a phi source or an if condition. */
+static bool
+bi_tree_movable_use(nir_src *use, nir_block *block)
+{
+   if (nir_src_is_if(use))
+      return false;
+   nir_instr *user = nir_src_use_instr(use);
+   return user->type != nir_instr_type_phi && user->block != block &&
+          !bi_tree_block_runs_more(user->block, block);
+}
+
+/* def's expression built again at *cursor (the clones made for that block
+ * so far in remap). */
+static nir_def *
+bi_tree_clone(nir_shader *nir, nir_def *def, struct hash_table *remap,
+              nir_cursor *cursor, const struct bi_tree_info *infos, unsigned n)
+{
+   struct hash_entry *e = _mesa_hash_table_search(remap, def);
+   if (e)
+      return e->data;
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   for (unsigned s = 0; s < nir_op_infos[alu->op].num_inputs; s++) {
+      nir_def *src = alu->src[s].src.ssa;
+      if (src->index < n && nir_def_instr(src)->block == alu->instr.block &&
+          !infos[src->index].free && infos[src->index].size > 0)
+         bi_tree_clone(nir, src, remap, cursor, infos, n);
+   }
+   nir_instr *clone = nir_instr_clone_deep(nir, &alu->instr, remap);
+   nir_instr_insert(*cursor, clone);
+   *cursor = nir_after_instr(clone);
+   nir_def *cdef = &nir_instr_as_alu(clone)->def;
+   _mesa_hash_table_insert(remap, def, cdef);
+   return cdef;
+}
+
+static int
+bi_tree_root_cmp(const void *a, const void *b)
+{
+   const struct bi_tree_root *x = a, *y = b;
+   if (x->block != y->block)
+      return x->block < y->block ? -1 : 1;
+   if (x->leaf != y->leaf)
+      return x->leaf < y->leaf ? -1 : 1;
+   return 0;
+}
+
+static bool
+bi_remat_trees(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_index_ssa_defs(impl);
+      nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_live_defs);
+      const unsigned n = impl->ssa_alloc;
+      struct bi_tree_info *infos = calloc(n, sizeof(*infos));
+      BITSET_WORD *done = calloc(BITSET_WORDS(n), sizeof(BITSET_WORD));
+      struct hash_table **remaps = calloc(impl->num_blocks, sizeof(*remaps));
+      nir_cursor *cursors = calloc(impl->num_blocks, sizeof(*cursors));
+      struct bi_tree_root *roots = malloc(n * sizeof(*roots));
+      if (!infos || !done || !remaps || !cursors || !roots) {
+         free(infos);
+         free(done);
+         free(remaps);
+         free(cursors);
+         free(roots);
+         return progress;
+      }
+
+      /* The values to build again: an expression of at most one leaf, used
+       * in blocks that do not run more often. */
+      unsigned nroots = 0;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            bool later = false;
+            nir_foreach_use_including_if(use, &alu->def)
+               later |= bi_tree_movable_use(use, block);
+            if (!later)
+               continue;
+            struct bi_tree_info info = bi_tree_info(&alu->def, infos, done, n);
+            if (info.size == 0)
+               continue;
+            roots[nroots++] = (struct bi_tree_root){
+               .alu = alu,
+               .block = block->index,
+               .leaf = info.leaf ? info.leaf->index : UINT_MAX,
+            };
+         }
+      }
+      qsort(roots, nroots, sizeof(*roots), bi_tree_root_cmp);
+
+      bool impl_progress = false;
+      for (unsigned i = 0, run = 0; i < nroots; i++) {
+         /* The run of roots of this block with this leaf. */
+         if (i == 0 || bi_tree_root_cmp(&roots[i - 1], &roots[i]) != 0) {
+            run = 1;
+            while (i + run < nroots && bi_tree_root_cmp(&roots[i], &roots[i + run]) == 0)
+               run++;
+         }
+         nir_alu_instr *alu = roots[i].alu;
+         nir_block *block = alu->instr.block;
+         nir_def *leaf = infos[alu->def.index].leaf;
+         /* Where it pays: two values of the block share the leaf, or the
+          * leaf lives on after the block anyway (liveness of the program
+          * before this pass). */
+         if (leaf && run < 2 && !u_sparse_bitset_test(&block->live_out, leaf->index))
+            continue;
+         nir_foreach_use_including_if_safe(use, &alu->def) {
+            if (!bi_tree_movable_use(use, block))
+               continue;
+            nir_block *at = nir_src_use_instr(use)->block;
+            if (!remaps[at->index]) {
+               remaps[at->index] = _mesa_pointer_hash_table_create(NULL);
+               cursors[at->index] = nir_after_phis(at);
+            }
+            nir_def *clone = bi_tree_clone(nir, &alu->def, remaps[at->index],
+                                           &cursors[at->index], infos, n);
+            nir_src_rewrite(use, clone);
+            impl_progress = true;
+         }
+      }
+
+      for (unsigned i = 0; i < impl->num_blocks; i++) {
+         if (remaps[i])
+            _mesa_hash_table_destroy(remaps[i], NULL);
+      }
+      free(roots);
+      free(cursors);
+      free(remaps);
+      free(done);
+      free(infos);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   if (progress)
+      nir_opt_dce(nir);
+   return progress;
+}
+
 /* The program in BIR, register allocated (bi_register_allocate: NULL when
  * that gives up on a spill to the full register file). offset is where the
  * program will go in the binary. */
@@ -4391,6 +4675,10 @@ bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
    if (ctx->stage == MESA_SHADER_VERTEX && ctx->arch <= 7 &&
        !(bifrost_debug & BIFROST_DBG_NOATTRREMAT))
       NIR_PASS(_, nir, bi_remat_attributes_in_loops);
+
+   if (ctx->stage == MESA_SHADER_VERTEX && ctx->arch <= 7 &&
+       !(bifrost_debug & BIFROST_DBG_NOTREEREMAT))
+      NIR_PASS(_, nir, bi_remat_trees);
 
    /* If nothing is pushed, all UBOs need to be uploaded */
    ctx->ubo_mask = ~0;
