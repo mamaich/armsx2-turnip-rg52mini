@@ -4266,7 +4266,9 @@ bi_remat_attributes_in_loops(nir_shader *nir)
    bool progress = false;
    nir_foreach_function_impl(impl, nir) {
       nir_metadata_require(impl, nir_metadata_block_index);
-      nir_def **loads = calloc(impl->num_blocks, sizeof(nir_def *));
+      /* The loads made for the block of each index: after its phis, and
+       * (from num_blocks on) at its end, before a nested loop. */
+      nir_def **loads = calloc(2 * impl->num_blocks, sizeof(nir_def *));
       if (!loads)
          return progress;
       bool impl_progress = false;
@@ -4279,28 +4281,41 @@ bi_remat_attributes_in_loops(nir_shader *nir)
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             if (intr->intrinsic != nir_intrinsic_load_attr_pan)
                continue;
-            memset(loads, 0, impl->num_blocks * sizeof(nir_def *));
-            nir_foreach_use_including_if_safe(use, &intr->def) {
-               if (nir_src_is_if(use))
-                  continue;
-               nir_instr *user = nir_src_use_instr(use);
-               if (user->type == nir_instr_type_phi || !bi_cf_node_in_loop(&user->block->cf_node))
-                  continue;
-               /* The outermost of the loops nested in another loop that
-                * hold the use, if any. */
-               nir_cf_node *nested = NULL;
-               for (nir_cf_node *n = user->block->cf_node.parent; n; n = n->parent) {
-                  if (n->type == nir_cf_node_loop && bi_cf_node_in_loop(n))
-                     nested = n;
+            memset(loads, 0, 2 * impl->num_blocks * sizeof(nir_def *));
+            /* The uses in the loop's blocks first, those of nested loops
+             * after: a block that has a load after its phis serves the
+             * nested loop after it with that one, where a load at the end
+             * of the block would come after the block's own uses. */
+            for (unsigned round = 0; round < 2; round++) {
+               nir_foreach_use_including_if_safe(use, &intr->def) {
+                  if (nir_src_is_if(use))
+                     continue;
+                  nir_instr *user = nir_src_use_instr(use);
+                  if (user->type == nir_instr_type_phi ||
+                      !bi_cf_node_in_loop(&user->block->cf_node))
+                     continue;
+                  /* The outermost of the loops nested in another loop
+                   * that hold the use, if any. */
+                  nir_cf_node *nested = NULL;
+                  for (nir_cf_node *n = user->block->cf_node.parent; n; n = n->parent) {
+                     if (n->type == nir_cf_node_loop && bi_cf_node_in_loop(n))
+                        nested = n;
+                  }
+                  if ((nested != NULL) != (round == 1))
+                     continue;
+                  nir_block *at =
+                     nested ? nir_cf_node_as_block(nir_cf_node_prev(nested)) : user->block;
+                  nir_def **top = &loads[at->index];
+                  nir_def **end = &loads[impl->num_blocks + at->index];
+                  if (!*top && !(nested && *end)) {
+                     nir_instr *load = nir_instr_clone(nir, instr);
+                     nir_instr_insert(nested ? nir_after_block_before_jump(at) : nir_after_phis(at),
+                                      load);
+                     *(nested ? end : top) = &nir_instr_as_intrinsic(load)->def;
+                  }
+                  nir_src_rewrite(use, *top ? *top : *end);
+                  impl_progress = true;
                }
-               nir_block *at = nested ? nir_cf_node_as_block(nir_cf_node_prev(nested)) : user->block;
-               if (!loads[at->index]) {
-                  nir_instr *load = nir_instr_clone(nir, instr);
-                  nir_instr_insert(nested ? nir_after_block_before_jump(at) : nir_after_phis(at), load);
-                  loads[at->index] = &nir_instr_as_intrinsic(load)->def;
-               }
-               nir_src_rewrite(use, loads[at->index]);
-               impl_progress = true;
             }
             if (nir_def_is_unused(&intr->def))
                nir_instr_remove(instr);
