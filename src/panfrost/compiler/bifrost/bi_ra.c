@@ -1600,10 +1600,9 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
          /* By default, we use packed TLS addressing on Valhall.
           * We cannot cross 16 byte boundaries with packed TLS
           * addressing. Align to ensure this doesn't happen. This
-          * could be optimized a bit.
+          * could be optimized a bit. Bifrost needs it as well.
           */
-         if (ctx->arch >= 9)
-            spill_count = ALIGN_POT(spill_count, 16);
+         spill_count = ALIGN_POT(spill_count, 16);
          if (verbose) {
             fprintf(stderr, "\nspill_registers=%d\n", spill_count);
             bi_print_shader(ctx, stderr);
