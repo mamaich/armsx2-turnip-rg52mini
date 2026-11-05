@@ -905,7 +905,10 @@ bi_spill_register(bi_context *ctx, bi_index index, uint32_t offset,
    assert(index.value < ctx->ssa_alloc);
    unsigned channels = ctx->reg_alignment[index.value] / 4;
    assert(channels > 0);
-   unsigned alignment = (ctx->arch >= 9) ? ctx->reg_alignment[index.value] : 4;
+   /* Aligned to the size on Bifrost too, as on Valhall: on Mali-G52 a
+    * vector slot across a 16-byte boundary of thread local storage reads
+    * back wrong words (an i128 spill at 0xc, i64/i96 fills from it). */
+   unsigned alignment = ctx->reg_alignment[index.value];
 
    /* first figure out the alignment we will need, based on the
     * maximum count we see
@@ -1573,16 +1576,17 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
                : BI_MAX_REGS - 8;
          bi_spill_ssa(ctx, target);
          spilled_to_full_file = target == BI_MAX_REGS;
+         /* bi_lower_spill aligns its slots relative to the base. */
+         spill_count = ALIGN_POT(spill_count, 16);
          spill_count += bi_lower_spill(ctx, spill_count);
          spilled_ssa = true;
 
          /* By default, we use packed TLS addressing on Valhall.
           * We cannot cross 16 byte boundaries with packed TLS
           * addressing. Align to ensure this doesn't happen. This
-          * could be optimized a bit.
+          * could be optimized a bit. Bifrost needs it as well.
           */
-         if (ctx->arch >= 9)
-            spill_count = ALIGN_POT(spill_count, 16);
+         spill_count = ALIGN_POT(spill_count, 16);
          if (verbose) {
             fprintf(stderr, "\nspill_registers=%d\n", spill_count);
             bi_print_shader(ctx, stderr);
