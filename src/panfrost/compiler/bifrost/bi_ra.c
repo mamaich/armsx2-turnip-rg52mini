@@ -1489,6 +1489,16 @@ compute_spill_cost(bi_context *ctx)
  */
 #define BI_FULL_FILE_ROUNDS 4
 
+/* Above this many instructions a shader is not tried at the full register
+ * file. Off the device (the shaders of Luigi's Mansion 2, Castlevania,
+ * Super Mario 3D Land, Luigi's Mansion, ARMSX2 and Dolphin), every such
+ * attempt but one shader's gave up after BI_FULL_FILE_ROUNDS and the shader
+ * was compiled again, and that one's code was no better than with the
+ * slack; each attempt is a few complete rounds of LCRA on thousands of
+ * instructions.
+ */
+#define BI_FULL_FILE_MAX_INSTRS 5000
+
 /*
  * With full_file_spill, a shader whose demand is over the register file,
  * but at most twice the file, is spilled in SSA form to the whole file, and
@@ -1547,13 +1557,18 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
           * against 99). The number of those rounds grows with the demand
           * over the file: Luigi's Mansion 2's vertex shaders (demand 147
           * to 176) took 9 to 80 at the full file. So the full file is
-          * tried for a demand of at most twice the file, and the shader
-          * is compiled again with the slack when LCRA does not colour it
-          * within BI_FULL_FILE_ROUNDS.
+          * tried for a demand of at most twice the file and a shader of
+          * at most BI_FULL_FILE_MAX_INSTRS, and the shader is compiled
+          * again with the slack when LCRA does not colour it within
+          * BI_FULL_FILE_ROUNDS.
           */
+         unsigned instrs = 0;
+         bi_foreach_instr_global(ctx, I)
+            instrs++;
          const unsigned target =
             regs_to_use != BI_MAX_REGS ? regs_to_use
-            : full_file_spill && register_demand <= 2 * BI_MAX_REGS
+            : full_file_spill && register_demand <= 2 * BI_MAX_REGS &&
+                    instrs <= BI_FULL_FILE_MAX_INSTRS
                ? BI_MAX_REGS
                : BI_MAX_REGS - 8;
          bi_spill_ssa(ctx, target);
