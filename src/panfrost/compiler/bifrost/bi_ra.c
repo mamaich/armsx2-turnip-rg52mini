@@ -1493,14 +1493,15 @@ compute_spill_cost(bi_context *ctx)
 #define BI_FULL_FILE_ROUNDS 4
 
 /* Above this many instructions a shader is not tried at the full register
- * file. Off the device (the shaders of Luigi's Mansion 2, Castlevania,
- * Super Mario 3D Land, Luigi's Mansion, ARMSX2 and Dolphin), every such
- * attempt but one shader's gave up after BI_FULL_FILE_ROUNDS and the shader
- * was compiled again, and that one's code was no better than with the
- * slack; each attempt is a few complete rounds of LCRA on thousands of
- * instructions.
+ * file: there most attempts give up after BI_FULL_FILE_ROUNDS, and the
+ * shader is compiled again, each attempt a few complete rounds of LCRA on
+ * thousands of instructions. Off the device, the vertex shaders of Luigi's
+ * Mansion 2 and its Dark Moon that are tried (3983 to 4998 instructions,
+ * with the known conditions of ifs folded) colour up to 4436 instructions
+ * (106 of them) and give up from 4430 on (38); ARMSX2's spilling shaders,
+ * which colour at the full file, are below 2500.
  */
-#define BI_FULL_FILE_MAX_INSTRS 5000
+#define BI_FULL_FILE_MAX_INSTRS 4500
 
 /*
  * With full_file_spill, a shader whose demand is over the register file,
