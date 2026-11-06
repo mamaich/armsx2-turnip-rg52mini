@@ -1194,11 +1194,21 @@ bi_phi_copy_to(bi_builder *b, bi_index dst, bi_index src, unsigned words)
    }
 }
 
+/* Whether source s of a phi spilled to memory is in the phi's own slot. */
+static bool
+bi_is_mem_phi_noop(const bi_instr *I, unsigned s)
+{
+   return I->src[s].type == BI_INDEX_NORMAL && I->src[s].memory &&
+          I->src[s].value == I->dest[0].value;
+}
+
 /*
  * Whether the phis of block spilled to memory may be stored straight into
  * their slots at the end of the predecessors. That turns the parallel copy
  * on each edge into a sequential one, so no predecessor may lead elsewhere
- * too, and no phi of the block may read a slot such a phi writes.
+ * too, and no phi of the block may read a slot such a phi writes. A phi
+ * that bi_lower_spill gave the slot of its source on an edge writes nothing
+ * there.
  */
 static bool
 bi_can_store_mem_phis_in_preds(bi_block *block)
@@ -1214,7 +1224,8 @@ bi_can_store_mem_phis_in_preds(bi_block *block)
 
       bi_foreach_phi_in_block(block, J) {
          bi_foreach_ssa_src(J, s) {
-            if (J->src[s].memory && J->src[s].value == I->dest[0].value)
+            if (J->src[s].memory && J->src[s].value == I->dest[0].value &&
+                !bi_is_mem_phi_noop(I, s))
                return false;
          }
       }
@@ -1247,6 +1258,21 @@ bi_out_of_ssa(bi_context *ctx)
          unsigned words = I->table ? I->table : 1;
          assert(words >= 1 && words <= 4);
 
+         /* bi_lower_spill gave a phi spilled to memory the slot of all its
+          * sources: nothing to copy.
+          */
+         if (I->dest[0].memory) {
+            bool noop = true;
+
+            bi_foreach_src(I, s)
+               noop &= bi_is_mem_phi_noop(I, s);
+
+            if (noop) {
+               bi_remove_instruction(I);
+               continue;
+            }
+         }
+
          /* A phi spilled to memory has no register to arrive in:
           * bi_spill_ssa counted none for it. Store each source into
           * its slot at the end of the predecessor, rather than carry
@@ -1257,7 +1283,11 @@ bi_out_of_ssa(bi_context *ctx)
          if (I->dest[0].memory && mem_phis_in_preds) {
             bi_foreach_predecessor(block, pred) {
                bi_builder b = bi_init_builder(ctx, bi_after_block_logical(*pred));
-               bi_index src = I->src[bi_predecessor_index(block, *pred)];
+               unsigned s = bi_predecessor_index(block, *pred);
+               bi_index src = I->src[s];
+
+               if (bi_is_mem_phi_noop(I, s))
+                  continue;
 
                if (src.type != BI_INDEX_NORMAL || src.memory) {
                   bi_index tmp = bi_temp(ctx);
