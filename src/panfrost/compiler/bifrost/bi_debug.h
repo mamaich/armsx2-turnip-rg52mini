@@ -36,6 +36,7 @@ extern "C" {
 #define BIFROST_DBG_NOTREEREMAT 0x80000
 #define BIFROST_DBG_NOFOLDIF  0x100000
 #define BIFROST_DBG_NOLOOPFLAGS 0x200000
+#define BIFROST_DBG_NOMEMCOALESCE 0x400000
 
 extern unsigned bifrost_debug;
 

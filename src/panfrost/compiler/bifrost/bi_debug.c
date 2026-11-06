@@ -33,6 +33,7 @@ static const struct debug_named_value bifrost_debug_options[] = {
    {"notreeremat", BIFROST_DBG_NOTREEREMAT, "Keep cheap expressions where they are computed"},
    {"nofoldif",   BIFROST_DBG_NOFOLDIF,   "Keep the uses of an if's condition in its branches"},
    {"noloopflags", BIFROST_DBG_NOLOOPFLAGS, "Keep loop-carried comparisons of a counter with constants"},
+   {"nomemcoalesce", BIFROST_DBG_NOMEMCOALESCE, "Give every spilled value a slot of its own"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
