@@ -1533,16 +1533,40 @@ compute_spill_cost(bi_context *ctx)
  */
 #define BI_FULL_FILE_MAX_INSTRS 4500
 
+/* Registers the last attempt of bi_register_allocate leaves out of the file.
+ * LCRA colours after bi_out_of_ssa and needs room the SSA pressure does not
+ * count (vectors, the copies of phis); what it cannot colour it spills with a
+ * fill before every use. With 8 left out (the region the spiller reserves),
+ * LCRA failed on 70 of the 77 programs of Dark Moon's intro spilled in SSA
+ * form (halves of its vertex shaders): 466 rounds that spilled 925 values
+ * with 9527 fills, most of them in the dispatcher loops of the emulated PICA
+ * programs. Compiled again with 12 left out, those 70 take 228 rounds that
+ * spill 456 values with 3060 fills, and the set has 6 % fewer static cycles
+ * (Luigi's Mansion 2's set 4 %). 10 does as well by static cycles but keeps
+ * more of those fills, 16 spills twice the values in SSA form and costs more
+ * than it saves.
+ */
+#define BI_SPILL_SLACK 12
+
 /*
- * With full_file_spill, a shader whose demand is over the register file,
- * but at most twice the file, is spilled in SSA form to the whole file, and
- * false is returned, with the shader half allocated, when LCRA still cannot
- * colour it after BI_FULL_FILE_ROUNDS rounds of spilling: the caller then
- * compiles it again with full_file_spill false, which spills to 8 registers
- * fewer.
+ * A shader whose demand is over the register file is spilled in SSA form and
+ * coloured by LCRA in up to three attempts, the caller compiling it from NIR
+ * anew for each. On entry *attempt is the first one allowed, on return the
+ * one made; false is returned, with the shader half allocated, when that
+ * attempt gave up:
+ *
+ *  0. spilled to the whole file, for a demand of at most twice the file and
+ *     at most BI_FULL_FILE_MAX_INSTRS instructions; gives up when LCRA still
+ *     fails after BI_FULL_FILE_ROUNDS rounds of spilling;
+ *  1. spilled to 8 registers fewer (the region the spiller reserves); gives
+ *     up when LCRA cannot colour that without spilling, unless
+ *     BIFROST_MESA_DEBUG=nospillretry;
+ *  2. spilled to BI_SPILL_SLACK registers fewer, LCRA spilling what it must.
+ *
+ * A shader that is not spilled in SSA form makes one attempt.
  */
 bool
-bi_register_allocate(bi_context *ctx, bool full_file_spill)
+bi_register_allocate(bi_context *ctx, unsigned *attempt)
 {
    struct lcra_state *l = NULL;
    bool success = false;
@@ -1552,7 +1576,6 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
    /* Number of bytes of memory we've spilled into */
    unsigned spill_count = ctx->info.tls_size;
    bool spilled_ssa = false;
-   bool spilled_to_full_file = false;
    unsigned full_file_rounds = 0;
 
    if (ctx->arch >= 9)
@@ -1594,19 +1617,23 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
           * tried for a demand of at most twice the file and a shader of
           * at most BI_FULL_FILE_MAX_INSTRS, and the shader is compiled
           * again with the slack when LCRA does not colour it within
-          * BI_FULL_FILE_ROUNDS.
+          * BI_FULL_FILE_ROUNDS; and with more slack when LCRA does not
+          * colour that without spilling (see BI_SPILL_SLACK).
           */
          unsigned instrs = 0;
          bi_foreach_instr_global(ctx, I)
             instrs++;
+         if (regs_to_use != BI_MAX_REGS)
+            *attempt = BI_RA_LAST_ATTEMPT;
+         else if (*attempt == 0 && (register_demand > 2 * BI_MAX_REGS ||
+                                    instrs > BI_FULL_FILE_MAX_INSTRS))
+            *attempt = 1;
          const unsigned target =
             regs_to_use != BI_MAX_REGS ? regs_to_use
-            : full_file_spill && register_demand <= 2 * BI_MAX_REGS &&
-                    instrs <= BI_FULL_FILE_MAX_INSTRS
-               ? BI_MAX_REGS
-               : BI_MAX_REGS - 8;
+            : *attempt == 0          ? BI_MAX_REGS
+            : *attempt == 1          ? BI_MAX_REGS - 8
+                                     : BI_MAX_REGS - BI_SPILL_SLACK;
          bi_spill_ssa(ctx, target);
-         spilled_to_full_file = target == BI_MAX_REGS;
          /* bi_lower_spill aligns its slots relative to the base. */
          spill_count = ALIGN_POT(spill_count, 16);
          spill_count += bi_lower_spill(ctx, spill_count);
@@ -1624,6 +1651,9 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
          }
       }
    }
+
+   if (!spilled_ssa)
+      *attempt = BI_RA_LAST_ATTEMPT;
 
    /* Lower tied operands. SSA is broken from here on. */
    unsigned first_reg = bi_out_of_ssa(ctx);
@@ -1651,8 +1681,10 @@ bi_register_allocate(bi_context *ctx, bool full_file_spill)
 
       if (success) {
          ctx->info.work_reg_count = BI_MAX_REGS;
-      } else if (spilled_to_full_file &&
-                 full_file_rounds++ == BI_FULL_FILE_ROUNDS) {
+      } else if ((*attempt == 0 &&
+                  full_file_rounds++ == BI_FULL_FILE_ROUNDS) ||
+                 (*attempt == 1 &&
+                  !(bifrost_debug & BIFROST_DBG_NOSPILLRETRY))) {
          lcra_free(l);
          return false;
       } else {

@@ -1669,7 +1669,9 @@ void bi_lower_fau(bi_context *ctx);
 uint64_t bi_instr_read_mask(bi_instr *I, bool staging_only);
 uint64_t bi_instr_write_mask(bi_instr *I);
 void bi_assign_scoreboard(bi_context *ctx);
-bool bi_register_allocate(bi_context *ctx, bool full_file_spill);
+/* The last of bi_register_allocate's attempts, which does not give up */
+#define BI_RA_LAST_ATTEMPT 2
+bool bi_register_allocate(bi_context *ctx, unsigned *attempt);
 void va_optimize(bi_context *ctx);
 void va_lower_split_64bit(bi_context *ctx);
 

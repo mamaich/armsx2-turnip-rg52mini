@@ -4612,12 +4612,12 @@ bi_remat_trees(nir_shader *nir)
 }
 
 /* The program in BIR, register allocated (bi_register_allocate: NULL when
- * that gives up on a spill to the full register file). offset is where the
- * program will go in the binary. */
+ * attempt *attempt gives up, *attempt then the one it made). offset is where
+ * the program will go in the binary. */
 static bi_context *
 bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
                       struct pan_shader_info *pinfo, enum bi_idvs_mode idvs,
-                      unsigned offset, bool full_file_spill)
+                      unsigned offset, unsigned *attempt)
 {
    bi_context *ctx = rzalloc(NULL, bi_context);
    struct bi_shader_info info = {
@@ -4644,13 +4644,13 @@ bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
       /* Specializing shaders for IDVS is destructive, so we need to
        * clone. However, the last (second) IDVS shader does not need
        * to be preserved so we can skip cloning that one, unless this
-       * is the attempt at the full register file: when that gives up,
+       * attempt of register allocation may give up: then
        * bi_compile_variant_nir compiles the variant again from the same
        * NIR, which must not be the one specialized and cleaned up here
        * already (that clean-up's CSE would merge back the attribute
        * loads bi_remat_attributes_in_loops put into the loops).
        */
-      if (offset == 0 || full_file_spill)
+      if (offset == 0 || *attempt < BI_RA_LAST_ATTEMPT)
          ctx->nir = nir = nir_shader_clone(ctx, nir);
 
       uint64_t position = VA_SHADER_OUTPUT_POSITION_BIT |
@@ -4858,7 +4858,7 @@ bi_compile_variant_ra(nir_shader *nir, const struct pan_compile_inputs *inputs,
       bi_validate(ctx, "Pre-RA scheduling");
    }
 
-   if (!bi_register_allocate(ctx, full_file_spill)) {
+   if (!bi_register_allocate(ctx, attempt)) {
       ralloc_free(ctx);
       return NULL;
    }
@@ -4875,17 +4875,21 @@ bi_compile_variant_nir(nir_shader *nir,
    /* There may be another program in the dynarray, start at the end */
    unsigned offset = binary->size;
 
-   /* A second attempt starts from the FAU layout and Bifrost info the
+   /* Another attempt starts from the FAU layout and Bifrost info the
     * first found: those are the parts of pinfo compiling writes before
     * register allocation (the push of UBO words, message preloads).
     */
    const struct pan_fau_layout fau = pinfo->fau;
    const struct bifrost_shader_info bifrost = pinfo->bifrost;
-   bi_context *ctx = bi_compile_variant_ra(nir, inputs, pinfo, idvs, offset, true);
-   if (!ctx) {
+   unsigned attempt = 0;
+   bi_context *ctx;
+
+   while (!(ctx = bi_compile_variant_ra(nir, inputs, pinfo, idvs, offset,
+                                        &attempt))) {
+      assert(attempt < BI_RA_LAST_ATTEMPT);
       pinfo->fau = fau;
       pinfo->bifrost = bifrost;
-      ctx = bi_compile_variant_ra(nir, inputs, pinfo, idvs, offset, false);
+      attempt++;
    }
 
    bool optimize = !(bifrost_debug & BIFROST_DBG_NOOPT);
